@@ -1,10 +1,16 @@
-from typing import List
-import datasets
-from datasets import Dataset
 import numpy as np
-import torch
 from transformers import AutoTokenizer, AutoModel
-import diskannpy
+import torch
+import datasets
+from tqdm import tqdm
+
+def numpy_to_bin(array, out_file):
+    shape = np.array(array.shape)
+    npts, ndims = [i.astype(np.uint32) for i in shape]
+    with open(out_file, "wb") as f:
+        f.write(npts.tobytes())
+        f.write(ndims.tobytes())
+        f.write(array.tobytes())
 
 def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"):
     if pooling_method == "mean":
@@ -26,10 +32,6 @@ def load_model(model_path: str, use_fp16: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
 
     return model, tokenizer
-
-def load_corpus(corpus_path: str) -> Dataset:
-    corpus = datasets.load_dataset("json", data_files=corpus_path, split="train")
-    return corpus # type: ignore
 
 class Encoder:
     """
@@ -55,12 +57,12 @@ class Encoder:
         self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
 
     @torch.inference_mode()
-    def encode(self, query: str) -> np.ndarray:
-        query = f"query: {query}"
+    def encode_all(self, query_list: list[str]) -> np.ndarray:
+        query_list = [f"query: {query}" for query in query_list]
 
         inputs = self.tokenizer(
-            query, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt"
-        )
+            query_list, max_length=self.max_length, padding=True, truncation=True, return_tensors="pt"
+        ).to("cuda")
         inputs = {k: v.cuda() for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
@@ -81,36 +83,23 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
         return query_emb
 
-def search(query):
+def main():
+    query_dataset = datasets.load_dataset("rajpurkar/squad", split="validation")
+    assert isinstance(query_dataset, datasets.Dataset)
     encoder = Encoder(
         model_path="intfloat/e5-base-v2",
         pooling_method="mean",
         max_length=180,
         use_fp16=True,
     )
-    index = diskannpy.StaticDiskIndex(
-        index_directory="indexes/e5_diskann_0.6",
-        num_threads=0,
-        num_nodes_to_cache=0,
-    )
-    corpus = load_corpus("../FlashRAG/corpus/wiki18_100w.jsonl")
-
-    emb = encoder.encode(query)
-    emb = emb.flatten()
-
-    print("embeddings created")
-
-    res = index.search(emb, k_neighbors=10, complexity=10, beam_width=1)
-    i = res.identifiers.tolist()
-    d = res.distances.tolist()
-    for ii, dd in zip(i, d):
-        print(corpus[ii], dd)
-
-
-def main():
-    # search("What is the capital of France?")
-    search("What is the capital of Japan?")
-
+    res = []
+    batch_size = 1024
+    for i in tqdm(range(0, len(query_dataset), batch_size)):
+        # encode in batches for speedup
+        queries = query_dataset["question"][i : i + batch_size]
+        res.append(encoder.encode_all(queries))
+    res = np.vstack(res)
+    numpy_to_bin(res, "./squad_val_qvecs.bin")
 
 if __name__ == "__main__":
     main()
